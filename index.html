@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Sonar Breath</title>
+<style>
+:root{
+  --bg:#f2f4f6; --panel:#fff; --fg:#16202a; --muted:#5d6a78; --line:#d6dce3;
+  --accent:#0b7a75; --warn:#c2410c; --screen:#0a1016; --wave:#3dd6c6;
+  --f:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+  --mono:ui-monospace,"SF Mono",Menlo,monospace;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#0d1217; --panel:#151c23; --fg:#e5eaef; --muted:#93a0ad; --line:#26313c;
+  --accent:#2bb5ac; --warn:#fb923c; --screen:#05080b; color-scheme:dark}}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--fg);font:15px/1.5 var(--f);
+  padding:max(16px,env(safe-area-inset-top)) max(16px,env(safe-area-inset-right)) max(24px,env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left))}
+.wrap{max-width:640px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+h1{margin:0;font-size:1.6rem;letter-spacing:-.01em}
+.sub{margin:.2rem 0 0;color:var(--muted)}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:10px}
+.big{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.big b{font-family:var(--mono);font-size:3.2rem;line-height:1;font-variant-numeric:tabular-nums}
+.big span{color:var(--muted)}
+canvas{width:100%;aspect-ratio:2.2/1;background:var(--screen);border-radius:6px;display:block}
+.row{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.row div{border-top:1px solid var(--line);padding-top:6px;min-width:0}
+.row small{display:block;color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.06em}
+.row b{font-family:var(--mono);font-variant-numeric:tabular-nums}
+button#go{font:600 1.05rem var(--f);padding:14px;border:0;border-radius:10px;background:var(--accent);color:#fff;cursor:pointer}
+button#go.on{background:var(--warn)}
+label{font-size:.85rem;font-weight:600;display:flex;flex-direction:column;gap:4px}
+select,input[type=range]{width:100%;font:inherit;accent-color:var(--accent)}
+select{padding:8px;border-radius:6px;border:1px solid var(--line);background:var(--bg);color:var(--fg)}
+.msg{font-size:.88rem;padding:10px 12px;border-radius:6px;background:var(--bg);border-left:3px solid var(--accent)}
+.msg.bad{border-color:var(--warn)}
+ol{margin:0;padding-left:1.2rem;font-size:.9rem}
+.fine{font-size:.78rem;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Sonar Breath</h1>
+    <p class="sub">Your iPhone plays an inaudible tone and listens to the echo from your chest. Breathing shifts the echo's phase.</p>
+  </header>
+
+  <section class="panel">
+    <div class="big"><b id="rate">--</b><span>breaths / min</span></div>
+    <canvas id="wave"></canvas>
+    <div class="row">
+      <div><small>Chest movement</small><b id="exc">--</b></div>
+      <div><small>Echo level</small><b id="lvl">--</b></div>
+      <div><small>Rhythm quality</small><b id="qual">--</b></div>
+    </div>
+    <div class="msg" id="status">Tap Start. Allow the microphone when Safari asks.</div>
+    <button id="go" type="button">Start</button>
+  </section>
+
+  <section class="panel">
+    <ol>
+      <li>Turn off silent mode and set the volume to about 75%.</li>
+      <li>Rest the phone 30–50 cm from your chest, bottom edge pointing at you.</li>
+      <li>Lie or sit still and breathe normally. Give it 15–20 seconds.</li>
+    </ol>
+    <label>Tone frequency
+      <select id="freq">
+        <option value="18000">18 kHz (stronger, children may hear it)</option>
+        <option value="19000" selected>19 kHz (default)</option>
+        <option value="20000">20 kHz (quietest, weaker on some phones)</option>
+      </select>
+    </label>
+    <label>Tone volume <input type="range" id="vol" min="0.05" max="1" step="0.05" value="0.6"></label>
+    <p class="fine">Experiment only, not a medical device. Children and pets can hear 18–20 kHz, so keep it away from them.</p>
+  </section>
+</div>
+
+<script>
+const FS=50, WIN=20*FS, SHOW=WIN;
+let ctx, osc, gainN, node, stream, wake, running=false;
+let raw=[];               // complex baseband samples [I,Q] at 50 Hz
+const $=id=>document.getElementById(id);
+
+const workletSrc=`
+class Demod extends AudioWorkletProcessor{
+  constructor(o){super();this.f=o.processorOptions.f;this.n=0;this.N=Math.round(sampleRate/${FS});this.i=0;this.q=0;this.c=0;}
+  process(inputs){
+    const x=inputs[0]&&inputs[0][0]; if(!x) return true;
+    const w=2*Math.PI*this.f/sampleRate;
+    for(let k=0;k<x.length;k++){
+      const ph=w*this.n; this.i+=x[k]*Math.cos(ph); this.q-=x[k]*Math.sin(ph);
+      if(++this.n>=sampleRate) this.n-=sampleRate;
+      if(++this.c>=this.N){this.port.postMessage([this.i/this.c,this.q/this.c]);this.i=this.q=this.c=0;}
+    }
+    return true;
+  }
+}
+registerProcessor('demod',Demod);`;
+
+async function start(){
+  const f=+$("freq").value;
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,channelCount:1}});
+  }catch(e){status("Microphone blocked. In Safari, tap aA → Website Settings → Microphone → Allow, then reload.",true);return;}
+  ctx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:48000});
+  await ctx.resume();
+  const url=URL.createObjectURL(new Blob([workletSrc],{type:"application/javascript"}));
+  await ctx.audioWorklet.addModule(url);
+  osc=ctx.createOscillator(); osc.frequency.value=f;
+  gainN=ctx.createGain(); gainN.gain.value=+$("vol").value;
+  osc.connect(gainN).connect(ctx.destination); osc.start();
+  const mic=ctx.createMediaStreamSource(stream);
+  node=new AudioWorkletNode(ctx,"demod",{processorOptions:{f}});
+  const sink=ctx.createGain(); sink.gain.value=0;
+  mic.connect(node).connect(sink).connect(ctx.destination);
+  raw=[];
+  node.port.onmessage=e=>{raw.push(e.data); if(raw.length>WIN) raw.shift();};
+  try{wake=await navigator.wakeLock?.request("screen");}catch(_){}
+  running=true; $("go").textContent="Stop"; $("go").classList.add("on"); $("freq").disabled=true;
+  status("Listening… stay still for 15–20 seconds.");
+}
+function stop(){
+  running=false;
+  try{osc.stop();}catch(_){}
+  stream?.getTracks().forEach(t=>t.stop()); ctx?.close(); wake?.release?.();
+  $("go").textContent="Start"; $("go").classList.remove("on"); $("freq").disabled=false;
+  status("Stopped.");
+}
+$("go").onclick=()=>running?stop():start();
+$("vol").oninput=e=>{if(gainN) gainN.gain.value=+e.target.value;};
+function status(t,bad){const s=$("status");s.textContent=t;s.classList.toggle("bad",!!bad);}
+
+// ---------- signal processing ----------
+function smooth(a,k){const o=[];for(let i=0;i<a.length;i++){let s0=0,s1=0,c=0;for(let j=Math.max(0,i-k);j<=Math.min(a.length-1,i+k);j++){s0+=a[j][0];s1+=a[j][1];c++;}o.push([s0/c,s1/c]);}return o;}
+function circleFit(p){ // Kasa least-squares circle fit
+  let sx=0,sy=0,sxx=0,syy=0,sxy=0,sxz=0,syz=0,sz=0,n=p.length;
+  for(const[x,y]of p){const z=x*x+y*y;sx+=x;sy+=y;sxx+=x*x;syy+=y*y;sxy+=x*y;sxz+=x*z;syz+=y*z;sz+=z;}
+  const M=[[sxx,sxy,sx],[sxy,syy,sy],[sx,sy,n]],v=[-sxz,-syz,-sz];
+  const det=m=>m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1])-m[0][1]*(m[1][0]*m[2][2]-m[1][2]*m[2][0])+m[0][2]*(m[1][0]*m[2][1]-m[1][1]*m[2][0]);
+  const D0=det(M); if(!isFinite(D0)||Math.abs(D0)<1e-30) return null;
+  const sol=[0,1,2].map(c=>det(M.map((r,i)=>r.map((x,j)=>j===c?v[i]:x)))/D0);
+  return {cx:-sol[0]/2, cy:-sol[1]/2};
+}
+function detrend(a){const n=a.length,mx=(n-1)/2;let my=0;for(const v of a)my+=v;my/=n;let num=0,den=0;a.forEach((v,i)=>{num+=(i-mx)*(v-my);den+=(i-mx)**2;});const b=num/den;return a.map((v,i)=>v-my-b*(i-mx));}
+function pca(p){let mx=0,my=0;for(const[x,y]of p){mx+=x;my+=y;}mx/=p.length;my/=p.length;let a=0,b=0,c=0;for(const[x,y]of p){const u=x-mx,w=y-my;a+=u*u;b+=u*w;c+=w*w;}const th=0.5*Math.atan2(2*b,a-c);return p.map(([x,y])=>(x-mx)*Math.cos(th)+(y-my)*Math.sin(th));}
+
+function analyse(){
+  if(raw.length<FS*4) return null;
+  const p=smooth(raw,3), f=+$("freq").value, lam=343/f;
+  let sig, mm=null;
+  const fit=circleFit(p);
+  if(fit){
+    let ph=p.map(([x,y])=>Math.atan2(y-fit.cy,x-fit.cx));
+    for(let i=1;i<ph.length;i++){let d=ph[i]-ph[i-1];if(d>Math.PI)ph[i]-=2*Math.PI*Math.ceil((d-Math.PI)/(2*Math.PI));else if(d<-Math.PI)ph[i]+=2*Math.PI*Math.ceil((-d-Math.PI)/(2*Math.PI));}
+    ph=detrend(ph);
+    const span=Math.max(...ph)-Math.min(...ph);
+    if(span>0.6&&span<40){sig=ph; mm=span*lam/(4*Math.PI)*1000;}
+  }
+  if(!sig) sig=detrend(pca(p));
+  // breathing rate from autocorrelation, lags 1.7–10 s (35–6 /min)
+  let best=0,bl=0; const n=sig.length; let e0=0; for(const v of sig)e0+=v*v;
+  if(n>FS*12&&e0>0){
+    const ac=[];for(let L=Math.round(1.2*FS);L<=Math.min(10*FS,n-FS*2);L++){let s=0;for(let i=0;i+L<n;i++)s+=sig[i]*sig[i+L];ac.push([L,s/e0*n/(n-L)]);}
+    for(let k=1;k<ac.length-1;k++){const[L,v]=ac[k];if(L>=1.7*FS&&v>ac[k-1][1]&&v>=ac[k+1][1]&&v>best){best=v;bl=L;}}
+  }
+  let lvl=0;for(const[x,y]of raw)lvl+=Math.hypot(x,y);lvl/=raw.length;
+  return {sig,mm,rate:best>0.3&&bl?60*FS/bl:null,q:best,lvl};
+}
+
+// ---------- drawing ----------
+const cv=$("wave");
+function draw(sig){
+  const d=devicePixelRatio||1,r=cv.getBoundingClientRect();
+  if(cv.width!==Math.round(r.width*d)){cv.width=Math.round(r.width*d);cv.height=Math.round(r.height*d);}
+  const g=cv.getContext("2d"),w=cv.width,h=cv.height;g.clearRect(0,0,w,h);
+  g.strokeStyle="rgba(200,215,225,.14)";g.lineWidth=1;
+  for(let s=0;s<=20;s+=5){const x=s/20*w;g.beginPath();g.moveTo(x,0);g.lineTo(x,h);g.stroke();}
+  g.fillStyle="rgba(200,215,225,.55)";g.font=`${10*d}px ui-monospace,Menlo,monospace`;
+  g.fillText("−20 s",6*d,h-6*d);g.fillText("now",w-28*d,h-6*d);
+  if(!sig||sig.length<2){g.fillText(running?"collecting echo…":"waiting to start",w/2-50*d,h/2);return;}
+  let mx=1e-9;for(const v of sig)mx=Math.max(mx,Math.abs(v));
+  g.strokeStyle="#3dd6c6";g.lineWidth=2*d;g.beginPath();
+  const off=SHOW-sig.length;
+  sig.forEach((v,i)=>{const x=(i+off)/SHOW*w,y=h/2-v/mx*(h/2-12*d);i?g.lineTo(x,y):g.moveTo(x,y);});g.stroke();
+}
+setInterval(()=>{
+  if(!running){draw(null);return;}
+  const a=analyse();
+  if(!a){draw(null);return;}
+  draw(a.sig);
+  const db=20*Math.log10(a.lvl+1e-12);
+  $("lvl").textContent=db.toFixed(0)+" dB";
+  $("exc").textContent=a.mm!=null?a.mm.toFixed(1)+" mm":"small";
+  $("qual").textContent=a.q>0.6?"good":a.q>0.3?"fair":"weak";
+  $("rate").textContent=a.rate?Math.round(a.rate):"--";
+  if(db<-75) status("Echo too weak. Turn silent mode off, raise the volume, or try 18 kHz.",true);
+  else if(raw.length<FS*12) status("Listening… stay still for 15–20 seconds.");
+  else if(!a.rate) status("No steady rhythm yet. Keep still, or move the phone a little closer.");
+  else status("Tracking. Try holding your breath: the wave should go flat.");
+},250);
+draw(null);
+</script>
+</body>
+</html>
